@@ -1,0 +1,34 @@
+{
+  "name": "irctc-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "demo:auth": "bun run scripts/auth-demo.ts",
+    "db:generate": "bunx prisma generate",
+    "db:migrate": "bunx prisma migrate dev",
+    "db:deploy": "bunx prisma migrate deploy",
+    "db:seed": "bunx prisma db seed",
+    "db:studio": "bunx prisma studio"
+  },
+  "dependencies": {
+    "@hono/zod-validator": "^0.9.1",
+    "@prisma/adapter-neon": "^7.10.1",
+    "@prisma/client": "7",
+    "dotenv": "^18.0.8",
+    "hono": "^4.13.13",
+    "hono-rate-limiter": "^0.5.4",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "prisma": "7",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

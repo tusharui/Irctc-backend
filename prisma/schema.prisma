@@ -1,0 +1,204 @@
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  runtime             = "bun"
+  moduleFormat        = "esm"
+  importFileExtension = ""
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  WAITLISTED
+}
+
+enum PaymentStatus {
+  INITIATED
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum ClassType {
+  SLEEPER
+  AC_3_TIER
+  AC_2_TIER
+  AC_1_TIER
+  CHAIR_CAR
+  SECOND_CLASS
+}
+
+// ───────────────────────────── Models ─────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  phone        String?
+  role         UserRole @default(CUSTOMER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  bookings Booking[]
+}
+
+model Station {
+  id    String @id @default(uuid())
+  code  String @unique // e.g. "NDLS"
+  name  String
+  city  String
+  state String?
+  zone  String?
+
+  originTrains Train[]    @relation("OriginTrains")
+  destTrains   Train[]    @relation("DestTrains")
+  stops        TrainStop[]
+}
+
+model Train {
+  id         String   @id @default(uuid())
+  number     String   @unique // e.g. "12001"
+  name       String
+  runsDaily  Boolean  @default(true)
+  startTime  String // "06:00"
+  endTime    String // "20:30"
+  distanceKm Int      @default(0)
+  baseFare   Int      @default(0) // paise
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  originStationId String
+  destStationId   String
+  originStation   Station  @relation("OriginTrains", fields: [originStationId], references: [id])
+  destStation     Station  @relation("DestTrains", fields: [destStationId], references: [id])
+
+  stops    TrainStop[]
+  classes  TrainClass[]
+  bookings Booking[]
+}
+
+model TrainStop {
+  id         String  @id @default(uuid())
+  trainId    String
+  stationId  String
+  stopIndex  Int
+  arrival    String?
+  departure  String?
+  distanceKm Int     @default(0)
+
+  train   Train   @relation(fields: [trainId], references: [id], onDelete: Cascade)
+  station Station @relation(fields: [stationId], references: [id])
+
+  @@unique([trainId, stopIndex])
+  @@index([stationId])
+}
+
+model TrainClass {
+  id            String    @id @default(uuid())
+  trainId       String
+  classType     ClassType
+  coachCount    Int       @default(1)
+  seatsPerCoach Int       @default(80)
+  totalSeats    Int
+  farePerKm     Int       @default(0) // paise per km
+  baseFare      Int       @default(0) // paise
+
+  train        Train          @relation(fields: [trainId], references: [id], onDelete: Cascade)
+  seats        Seat[]
+  bookingSeats BookingSeat[]
+
+  @@unique([trainId, classType])
+}
+
+model Seat {
+  id           String  @id @default(uuid())
+  trainClassId String
+  coachNumber  Int
+  seatNumber   Int
+  isAvailable  Boolean @default(true)
+
+  trainClass   TrainClass    @relation(fields: [trainClassId], references: [id], onDelete: Cascade)
+  bookingSeats BookingSeat[]
+
+  @@unique([trainClassId, coachNumber, seatNumber])
+  @@index([trainClassId, isAvailable])
+}
+
+model Booking {
+  id           String        @id @default(uuid())
+  pnr          String        @unique
+  userId       String
+  trainId      String
+  travelDate   DateTime      @db.Date
+  status       BookingStatus @default(PENDING)
+  totalAmount  Int
+  isRefundable Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  user       User              @relation(fields: [userId], references: [id])
+  train      Train             @relation(fields: [trainId], references: [id])
+  passengers BookingPassenger[]
+  seats      BookingSeat[]
+  payment    Payment?
+
+  @@index([userId])
+  @@index([trainId, travelDate])
+}
+
+model BookingPassenger {
+  id        String  @id @default(uuid())
+  bookingId String
+  name      String
+  age       Int
+  gender    Gender
+  berthPref String?
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+}
+
+model BookingSeat {
+  id           String @id @default(uuid())
+  bookingId    String
+  seatId       String
+  trainClassId String
+
+  booking    Booking    @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  seat       Seat       @relation(fields: [seatId], references: [id])
+  trainClass TrainClass @relation(fields: [trainClassId], references: [id])
+
+  @@unique([seatId])
+  @@index([bookingId])
+}
+
+model Payment {
+  id            String        @id @default(uuid())
+  bookingId     String        @unique
+  amount        Int
+  status        PaymentStatus @default(INITIATED)
+  transactionId String?       @unique
+  provider      String        @default("mock")
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+}
