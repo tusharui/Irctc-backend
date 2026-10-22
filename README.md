@@ -30,6 +30,15 @@ curl http://localhost:4000/api/db-check
 | `POST` | `/api/auth/register` | — | Create a user, returns `{ user, token }` (201) |
 | `POST` | `/api/auth/login` | — | Exchange credentials for `{ user, token }` (200) |
 | `GET` | `/api/auth/me` | Bearer | The current user, re-read from the database (200) |
+| `GET` | `/api/trains/search` | — | Trains between two stations, with fares (200) |
+| `GET` | `/api/trains/:id/availability` | — | Per-class seats left for a date (200) |
+| `POST` | `/api/bookings` | Bearer | Hold seats for a travel date, returns the booking (201) |
+| `GET` | `/api/bookings` | Bearer | The caller's bookings, newest first (200) |
+| `GET` | `/api/bookings/:id` | Bearer | One booking, owner only (200) |
+| `POST` | `/api/bookings/:id/cancel` | Bearer | Release seats, cancel, refund if paid (200) |
+| `POST` | `/api/bookings/:id/payment` | Bearer | Open the gateway order, idempotent (201 / 200) |
+| `POST` | `/api/webhooks/payment` | HMAC | Payment gateway callback (200) |
+| `POST` | `/api/admin/sweep-holds` | Admin | Release expired holds on demand (200) |
 
 ```bash
 # Register
@@ -39,6 +48,34 @@ curl -X POST http://localhost:4000/api/auth/register \
 
 # Use the token
 curl http://localhost:4000/api/auth/me -H "Authorization: Bearer <token>"
+
+# Search: fares are priced for the segment, not the whole run
+curl "http://localhost:4000/api/trains/search?from=NDLS&to=KGP&date=2027-01-15"
+
+# Availability for one train, whole run
+curl "http://localhost:4000/api/trains/<trainId>/availability?date=2027-01-15"
+
+# Availability for a segment
+curl "http://localhost:4000/api/trains/<trainId>/availability?date=2027-01-15&from=NDLS&to=KGP"
+
+# Hold one seat on that segment (stop indices come from the search response)
+curl -X POST http://localhost:4000/api/bookings \
+  -H "Authorization: Bearer <token>" \
+  -H "content-type: application/json" \
+  -d '{
+        "trainId": "<uuid>",
+        "travelDate": "2027-01-15",
+        "fromStopIndex": 0,
+        "toStopIndex": 1,
+        "passengers": [
+          { "name": "Asha Verma", "age": 31, "gender": "FEMALE", "seatId": "<uuid>" }
+        ]
+      }'
+
+# Open payment (idempotent — repeat calls return the same order)
+curl -X POST http://localhost:4000/api/bookings/<id>/payment \
+  -H "Authorization: Bearer <token>" \
+  -H "Idempotency-Key: 3f9c…"
 ```
 
 ### Error contract
@@ -74,6 +111,86 @@ Every error — validation, auth, rate limit, 404 — has the same shape:
 > The rate limiter's store is in-process (`MemoryStore`). With more than one instance
 > behind a load balancer, each instance keeps its own counters — swap in
 > `RedisStore` / `UnstorageStore` before scaling out.
+
+## Routes, segments and fares
+
+A train has an ordered route (`TrainStop`, `stopIndex` 0..n). A search is a
+question about a **segment**: board at stop `i`, alight at stop `j > i`. A
+train only appears in results when it visits both stations in that order —
+`from.stopIndex < to.stopIndex`. Stop ranges are half-open, `[from, to)`,
+matching `TicketSeat`: alighting at stop 3 and boarding at stop 3 are different
+passengers, not a conflict.
+
+Fare is per seat: `baseFare + farePerKm × segmentDistance`, in paise. The
+segment distance is `to.distanceKm − from.distanceKm` from the route, so
+Delhi → Bhopal does not pay the Delhi → Chennai price. `POST /api/bookings`
+accepts the same `fromStopIndex`/`toStopIndex` and charges the same number —
+there is a test asserting search and booking agree.
+
+**Availability is derived.** `totalSeats − booked − blocked`:
+
+| Term | Source |
+|---|---|
+| `totalSeats` | `TrainClass.totalSeats` |
+| `booked` | `BookingSeat` rows for that class and travel date |
+| `blocked` | `Seat.isAvailable = false` (admin took it out of service) |
+
+Bookings currently hold their seat for the **whole date**, not just the
+segment. That is deliberately conservative: it can never oversell, and it means
+availability is a simple per-class count. Letting a seat be resold on a
+disjoint segment (`A→B` and `B→C` on the same day) is what `JourneySeat` /
+`TicketSeat` and the `TicketSeat_no_segment_overlap` constraint are for; wiring
+bookings onto them is the next migration.
+
+## Booking and payment
+
+**Occupancy is derived, never stored twice.** `Seat.isAvailable` is operational
+state (an admin taking a coach out of service). Whether a seat is free on a date
+is answered by `BookingSeat(seatId, travelDate)`, which is `UNIQUE`. A seat is
+therefore reusable on every other date, and the database — not application
+code — decides who won a race.
+
+**The reservation transaction is short and lock-ordered.** `reserveSeats` takes
+`SELECT … FOR UPDATE … ORDER BY id` on the seat rows, re-checks occupancy under
+the lock, and writes the booking in the same transaction. Ordering prevents
+deadlocks; the unique index is the final backstop. Interactive transactions use
+a 20s timeout (`src/db/transaction.ts`) because Neon round trips can exceed
+Prisma's 5s default.
+
+**Fare is server-computed.** The client never sends money. The total is
+`baseFare + farePerKm × distanceKm` per seat, calculated inside the transaction.
+
+**Holds expire.** A booking is created `PENDING` with `holdExpiresAt` (10 minutes
+by default). `sweepExpiredHolds()` — run by cron or `POST /api/admin/sweep-holds`
+— takes `FOR UPDATE SKIP LOCKED`, deletes the allocations and marks the booking
+`CANCELLED`. It is idempotent and safe to run concurrently with itself.
+
+**Payments are idempotent at three layers:**
+
+1. `Payment.bookingId` is UNIQUE — one live payment per booking, enforced by the
+   database even if two requests race.
+2. `Idempotency-Key` header pins the result across client retries.
+3. `PaymentEvent.providerEventId` is UNIQUE — a replayed webhook is
+   `INSERT … ON CONFLICT DO NOTHING`, and "0 rows inserted" is the signal that it
+   was already handled. State transitions use compare-and-set on `Payment.version`.
+
+**Webhooks are signed.** `x-webhook-signature` is a hex HMAC-SHA256 of the raw
+body, verified in constant time against `PAYMENT_WEBHOOK_SECRET`. An unsigned
+event is recorded for forensics but never applied, and returns 401.
+
+**A late payment is never allowed to resurrect a booking.** If the hold has
+lapsed — checked against `holdExpiresAt`, not just the status, because the
+sweeper runs on a schedule — the payment is recorded, refunded, and the booking
+stays `CANCELLED`.
+
+### Constraint → HTTP mapping
+
+| Database outcome | Status | Meaning |
+|---|---|---|
+| `TicketSeat_no_segment_overlap` (23P01) | `409` | Overlapping journey segments on one seat |
+| unique violation (23505) | `409` | Duplicate key: seat taken, email registered, … |
+| other integrity violation | `400` | Check / foreign-key rejected the write |
+| unknown | `500` | A real bug |
 
 ## Scripts
 

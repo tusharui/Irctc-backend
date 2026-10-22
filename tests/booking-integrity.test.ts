@@ -127,7 +127,6 @@ describe("concurrent seat requests", () => {
         travelDate: new Date("2026-12-01"),
         seatIds: [seats[0]!.id],
         passengers: [passenger],
-        totalAmount: 100,
       }).then(
         () => "won" as const,
         () => "lost" as const
@@ -138,10 +137,13 @@ describe("concurrent seat requests", () => {
 
     expect(results.filter((r) => r === "won").length).toBe(1);
 
-    // The database agrees: one allocation, seat withdrawn from inventory.
+    // The database agrees: exactly one allocation for this date.
+    // Note that Seat.isAvailable is intentionally NOT touched: occupancy is
+    // derived from BookingSeat, so the same physical seat remains sellable on
+    // every other travel date.
     expect(await prisma.bookingSeat.count({ where: { seatId: seats[0]!.id } })).toBe(1);
-    const after = await prisma.seat.findUnique({ where: { id: seats[0]!.id } });
-    expect(after?.isAvailable).toBe(false);
+    const stillOnSale = await prisma.seat.findUnique({ where: { id: seats[0]!.id } });
+    expect(stillOnSale?.isAvailable).toBe(true);
 
     // And exactly one booking exists — no half-written loser.
     expect(await prisma.booking.count({ where: { trainId: train.id } })).toBe(1);
@@ -158,7 +160,6 @@ describe("concurrent seat requests", () => {
         travelDate: new Date("2026-12-02"),
         seatIds: [seats[0]!.id],
         passengers: [passenger],
-        totalAmount: 100,
       }).then(
         () => "won" as const,
         () => "lost" as const
@@ -182,7 +183,6 @@ describe("concurrent seat requests", () => {
       travelDate: new Date("2026-12-03"),
       seatIds: [seats[0]!.id],
       passengers: [passenger],
-      totalAmount: 100,
     });
 
     // Now ask for both. The second is free, but the first is not: the whole
@@ -195,7 +195,6 @@ describe("concurrent seat requests", () => {
         travelDate: new Date("2026-12-03"),
         seatIds: [seats[0]!.id, seats[1]!.id],
         passengers: [passenger, passenger],
-        totalAmount: 200,
       });
     } catch {
       failed = true;
@@ -203,9 +202,7 @@ describe("concurrent seat requests", () => {
 
     expect(failed).toBe(true);
 
-    // Seat 2 must still be available — no partial reservation leaked.
-    const seat2 = await prisma.seat.findUnique({ where: { id: seats[1]!.id } });
-    expect(seat2?.isAvailable).toBe(true);
+    // Seat 2 must still be free - no partial reservation leaked.
     expect(await prisma.bookingSeat.count({ where: { seatId: seats[1]!.id } })).toBe(0);
   }, 60_000);
 
@@ -221,7 +218,6 @@ describe("concurrent seat requests", () => {
       travelDate: new Date("2026-12-04"),
       seatIds: [seats[0]!.id],
       passengers: [passenger],
-      totalAmount: 100,
     });
     expect(first.bookingId).toBeTruthy();
 
@@ -235,11 +231,54 @@ describe("concurrent seat requests", () => {
       travelDate: new Date("2026-12-05"),
       seatIds: [seats[0]!.id],
       passengers: [passenger],
-      totalAmount: 100,
     });
 
     expect(second.bookingId).not.toBe(first.bookingId);
     expect(second.travelDate.toISOString().slice(0, 10)).toBe("2026-12-05");
+  }, 60_000);
+
+  test("the same seat can be held on two different dates at once", async () => {
+    const { train, seats } = await makeTrain({ seats: 1 });
+    const user = await makeUser();
+
+    // The seat is physically one seat, but it is a different seat on a
+    // different day. Nothing about booking 2026-12-06 should affect
+    // 2026-12-07. This is what the date-aware unique index buys us; the old
+    // global `UNIQUE(seatId)` (and using Seat.isAvailable as occupancy)
+    // made this impossible.
+    const monday = await reserveSeats({
+      userId: user.id,
+      trainId: train.id,
+      travelDate: new Date("2026-12-06"),
+      seatIds: [seats[0]!.id],
+      passengers: [passenger],
+    });
+
+    const tuesday = await reserveSeats({
+      userId: user.id,
+      trainId: train.id,
+      travelDate: new Date("2026-12-07"),
+      seatIds: [seats[0]!.id],
+      passengers: [passenger],
+    });
+
+    expect(tuesday.bookingId).not.toBe(monday.bookingId);
+    expect(await prisma.bookingSeat.count({ where: { seatId: seats[0]!.id } })).toBe(2);
+
+    // ...but a THIRD booking on the same date as an existing one is refused.
+    let rejected = false;
+    try {
+      await reserveSeats({
+        userId: user.id,
+        trainId: train.id,
+        travelDate: new Date("2026-12-06"),
+        seatIds: [seats[0]!.id],
+        passengers: [passenger],
+      });
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
   }, 60_000);
 
   test("travel dates are normalised: a timestamp becomes UTC midnight", async () => {
@@ -375,7 +414,6 @@ describe("duplicate payment webhooks", () => {
       travelDate: new Date("2026-12-10"),
       seatIds: [seats[0]!.id],
       passengers: [passenger],
-      totalAmount: amount,
     });
 
     const payment = await prisma.payment.create({
@@ -533,7 +571,6 @@ describe("expired holds", () => {
       travelDate: new Date("2026-12-11"),
       seatIds: [seats[0]!.id],
       passengers: [passenger],
-      totalAmount: 300,
     });
 
     // Simulate time passing.
@@ -553,8 +590,7 @@ describe("expired holds", () => {
     expect(result.bookingIds).toContain(reservation.bookingId);
     expect(result.releasedSeats).toBeGreaterThanOrEqual(1);
 
-    const seat = await prisma.seat.findUnique({ where: { id: seats[0]!.id } });
-    expect(seat?.isAvailable).toBe(true);
+    expect(await prisma.bookingSeat.count({ where: { seatId: seats[0]!.id } })).toBe(0);
 
     const booking = await prisma.booking.findUnique({ where: { id: reservation.bookingId } });
     expect(booking?.status).toBe("CANCELLED");
@@ -574,7 +610,6 @@ describe("expired holds", () => {
       travelDate: new Date("2026-12-12"),
       seatIds: [seats[0]!.id],
       passengers: [passenger],
-      totalAmount: 300,
       holdMinutes: 10,
     });
 
@@ -584,8 +619,7 @@ describe("expired holds", () => {
     const booking = await prisma.booking.findUnique({ where: { id: reservation.bookingId } });
     expect(booking?.status).toBe("PENDING");
 
-    const seat = await prisma.seat.findUnique({ where: { id: seats[0]!.id } });
-    expect(seat?.isAvailable).toBe(false);
+    expect(await prisma.bookingSeat.count({ where: { seatId: seats[0]!.id } })).toBe(1);
   }, 60_000);
 
   test("the sweeper is idempotent: a second pass is a no-op", async () => {
@@ -610,12 +644,10 @@ describe("expired holds", () => {
       travelDate: new Date("2026-12-11"),
       seatIds: [seats[0]!.id],
       passengers: [passenger],
-      totalAmount: 300,
     });
 
     expect(rebooked.bookingId).not.toBe(reservation.bookingId);
-    const seat = await prisma.seat.findUnique({ where: { id: seats[0]!.id } });
-    expect(seat?.isAvailable).toBe(false);
+    expect(await prisma.bookingSeat.count({ where: { seatId: seats[0]!.id } })).toBe(1);
   }, 60_000);
 
   test("releaseBookingSeats is idempotent", async () => {
@@ -628,7 +660,6 @@ describe("expired holds", () => {
       travelDate: new Date("2026-12-13"),
       seatIds: [seats[0]!.id],
       passengers: [passenger],
-      totalAmount: 100,
     });
 
     expect(await releaseBookingSeats(reservation.bookingId)).toBe(1);

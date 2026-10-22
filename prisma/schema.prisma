@@ -151,6 +151,8 @@ model Booking {
   travelDate   DateTime      @db.Date
   status       BookingStatus @default(PENDING)
   totalAmount  Int
+  fromStopIndex Int?
+  toStopIndex   Int?
   isRefundable Boolean       @default(true)
   holdExpiresAt DateTime?    @db.Timestamptz(3)
   createdAt    DateTime      @default(now())

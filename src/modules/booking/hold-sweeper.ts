@@ -1,5 +1,6 @@
 
 import { prisma } from "../../db/client";
+import { TRANSACTION_OPTIONS } from "../../db/transaction";
 
 export interface SweepResult {
   /** Number of bookings expired by this pass. */
@@ -42,18 +43,12 @@ export async function sweepExpiredHolds(
 
     const bookingIds = lapsed.map((row) => row.id);
 
-    // Free the physical seats.
+    // Free the seats. Deleting the allocation IS the release: occupancy is
+    // derived from BookingSeat, so there is no second flag to keep in sync.
     const held = await tx.bookingSeat.findMany({
       where: { bookingId: { in: bookingIds } },
       select: { seatId: true },
     });
-
-    if (held.length > 0) {
-      await tx.seat.updateMany({
-        where: { id: { in: held.map((h) => h.seatId) } },
-        data: { isAvailable: true },
-      });
-    }
 
     await tx.bookingSeat.deleteMany({
       where: { bookingId: { in: bookingIds } },
@@ -69,5 +64,5 @@ export async function sweepExpiredHolds(
       releasedSeats: held.length,
       bookingIds,
     };
-  });
+  }, TRANSACTION_OPTIONS);
 }

@@ -6,8 +6,11 @@ import { isExclusionViolation, isIntegrityViolation, isUniqueViolation } from ".
 import { errorBody } from "./lib/validation";
 import type { AuthVariables } from "./middleware/auth";
 import { authRoutes } from "./modules/auth/auth.routes";
+import { bookingRoutes } from "./modules/booking/booking.routes";
 import { healthRoutes } from "./modules/health/health.routes";
+import { paymentRoutes } from "./modules/payment/payment.routes";
 import { systemRoutes } from "./modules/system/system.routes";
+import { trainRoutes } from "./modules/train/train.routes";
 
 
 export function createApp() {
@@ -20,6 +23,9 @@ export function createApp() {
   app.route("/", healthRoutes);
   app.route("/", systemRoutes);
   app.route("/", authRoutes);
+  app.route("/", trainRoutes);
+  app.route("/", bookingRoutes);
+  app.route("/", paymentRoutes);
 
   app.notFound((c) => c.json(errorBody("Route not found"), 404));
 

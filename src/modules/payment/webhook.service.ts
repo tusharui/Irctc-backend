@@ -1,6 +1,7 @@
 
 import { HTTPException } from "hono/http-exception";
 import { prisma } from "../../db/client";
+import { TRANSACTION_OPTIONS } from "../../db/transaction";
 
 export interface WebhookEnvelope {
   /** The gateway's own event id. This is THE idempotency key. */
@@ -125,7 +126,9 @@ export async function handlePaymentWebhook(
       id: true,
       bookingId: true,
       status: true,
-      booking: { select: { id: true, status: true } },
+      booking: {
+        select: { id: true, status: true, holdExpiresAt: true },
+      },
     },
   });
 
@@ -149,7 +152,14 @@ export async function handlePaymentWebhook(
   }
 
   // ── 4. Late payment: the hold already lapsed ────────────────────────
-  if (payment.booking.status !== "PENDING") {
+  // Checked against `holdExpiresAt`, not just the status: the sweeper runs on
+  // a schedule, so a booking can still read PENDING for a while after its
+  // hold expired. Money must never resurrect those seats.
+  const holdLapsed =
+    payment.booking.holdExpiresAt !== null &&
+    payment.booking.holdExpiresAt.getTime() <= Date.now();
+
+  if (payment.booking.status !== "PENDING" || holdLapsed) {
     await compensateLatePayment(payment.bookingId, envelope.paymentId);
     return {
       recorded: true,
@@ -169,17 +179,38 @@ export async function handlePaymentWebhook(
 }
 
 /**
- * The customer paid, but the seats were already released. Refund in full and
- * leave a trail. This must never be silent.
+ * The customer paid, but the seats were already released (or the hold lapsed).
+ * Refund in full, release anything still held, and leave a trail. This must
+ * never be silent.
+ *
+ * Safe to run twice: the updates are idempotent and the booking is locked
+ * before anything else is touched.
  */
 async function compensateLatePayment(
   bookingId: string,
   paymentId: string
 ): Promise<void> {
   await prisma.$transaction(async (tx) => {
+    // Serialise against a concurrent sweeper or cancellation.
+    const rows = await tx.$queryRaw<{ id: string }[]>`
+      SELECT "id" FROM "Booking" WHERE "id" = ${bookingId} FOR UPDATE
+    `;
+    if (rows.length === 0) {
+      throw new HTTPException(404, { message: "Booking not found" });
+    }
+
+    // If the sweeper has not run yet, the seats are still allocated. Free
+    // them now instead of waiting for the next pass.
+    await tx.bookingSeat.deleteMany({ where: { bookingId } });
+
+    await tx.booking.update({
+      where: { id: bookingId },
+      data: { status: "CANCELLED", holdExpiresAt: null },
+    });
+
     await tx.payment.update({
       where: { id: paymentId },
-      data: { status: "REFUNDED" },
+      data: { status: "REFUNDED", version: { increment: 1 } },
     });
 
     await tx.paymentEvent.create({
@@ -191,5 +222,5 @@ async function compensateLatePayment(
         processedAt: new Date(),
       },
     });
-  });
+  }, TRANSACTION_OPTIONS);
 }
