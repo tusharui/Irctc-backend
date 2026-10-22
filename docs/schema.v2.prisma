@@ -1,0 +1,586 @@
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  runtime             = "bun"
+  moduleFormat        = "esm"
+  importFileExtension = ""
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+}
+
+enum TrainType {
+  EXPRESS
+  SUPERFAST
+  PASSENGER
+  MAIL
+  SUBWAY
+}
+
+enum ClassType {
+  FIRST_AC
+  SECOND_AC
+  THIRD_AC
+  CHAIR_CAR
+  SLEEPER_GENERAL
+  SECOND_CLASS
+  GN_RESERVED
+}
+
+enum SeatType {
+  SEAT
+  BERTH
+  SIDE_BERTH
+  FLOOR
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum JourneyStatus {
+  SCHEDULED
+  STARTED
+  COMPLETED
+  CANCELLED
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  PARTIALLY_CANCELLED
+  WAITLISTED
+  EXPIRED
+}
+
+enum TicketStatus {
+  PENDING // held, awaiting payment
+  CONFIRMED
+  RAC
+  WAITLISTED
+  NOT_AVAILABLE
+  CANCELLED
+  EXPIRED // hold lapsed, no payment
+}
+
+enum PaymentStatus {
+  INITIATED
+  PROCESSING
+  SUCCESS
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  EXPIRED // succeeded after the hold lapsed → must be refunded
+}
+
+enum PaymentMethod {
+  UPI
+  CARD
+  NETBANKING
+  WALLET
+  CASH_UPI
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
+enum RefundReason {
+  USER_CANCELLED
+  HOLD_EXPIRED
+  JOURNEY_CANCELLED
+  PAYMENT_AFTER_EXPIRY
+  DUPLICATE_PAYMENT
+}
+
+enum FareType {
+  BASE_FARE
+  GST
+  PASSENGER_CHARGE
+  CONVENIENCE_FEE
+  TATKAL_FEE
+  SUPPLY_BED
+  CANCELLATION_FEE
+  DISCOUNT
+  REFUND
+}
+
+enum OtpPurpose {
+  REGISTER
+  LOGIN
+  RESET_PASSWORD
+  EMAIL_CHANGE
+  PHONE_CHANGE
+}
+
+// ═════════════════════════ Identity ═════════════════════════
+
+model User {
+  id           String   @id @default(uuid(7))
+  email        String   @unique
+  phone        String?  @unique
+  passwordHash String
+  name         String
+  role         UserRole @default(CUSTOMER)
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime? @db.Timestamptz(3)
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  passengers    SavedPassenger[]
+  bookings      Booking[]
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+
+  @@index([role])
+  @@index([createdAt])
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid(7))
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime  @db.Timestamptz(3)
+  revokedAt DateTime? @db.Timestamptz(3)
+  userAgent String?
+  ip        String?
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// `@@unique([id, userId])` exists so Ticket can hold a composite FK and the
+// database itself proves a saved passenger belongs to the ticket's owner.
+model SavedPassenger {
+  id               String   @id @default(uuid(7))
+  userId           String
+  name             String
+  age              Int
+  gender           Gender
+  berthPreference  String?
+  isSeniorCitizen  Boolean  @default(false)
+  createdAt        DateTime @default(now()) @db.Timestamptz(3)
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tickets Ticket[]
+
+  @@unique([userId, name, age, gender])
+  @@unique([id, userId])
+  @@index([userId])
+}
+
+model OtpChallenge {
+  id         String     @id @default(uuid(7))
+  identifier String
+  purpose    OtpPurpose
+  codeHash   String
+  attempts   Int        @default(0)
+  expiresAt  DateTime   @db.Timestamptz(3)
+  consumedAt DateTime?  @db.Timestamptz(3)
+  createdAt  DateTime   @default(now()) @db.Timestamptz(3)
+
+  @@index([identifier, purpose])
+  @@index([expiresAt])
+}
+
+// ═════════════════════════ Network (static blueprint) ═════════════════════════
+
+model Station {
+  id    String  @id @default(uuid(7))
+  code  String  @unique
+  name  String
+  city  String
+  state String?
+  zone  String?
+  lat   Float?
+  lng   Float?
+
+  originTrains   Train[]   @relation("OriginTrains")
+  destTrains     Train[]   @relation("DestTrains")
+  stops          TrainStop[]
+  originBookings Booking[] @relation("BookingOrigin")
+  destBookings   Booking[] @relation("BookingDest")
+
+  @@index([city])
+  @@index([state])
+}
+
+// NOTE: no startTime/endTime here. Departure/arrival wall-clock times are a
+// property of a SCHEDULE, not of a train. TrainSchedule is the single source
+// of truth; `durationMinutes` and `distanceKm` describe the route itself.
+model Train {
+  id              String    @id @default(uuid(7))
+  number          String    @unique
+  name            String
+  type            TrainType @default(EXPRESS)
+  durationMinutes Int       @default(0)
+  distanceKm      Int       @default(0)
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(3)
+
+  originStationId String
+  destStationId   String
+  originStation   Station @relation("OriginTrains", fields: [originStationId], references: [id])
+  destStation     Station @relation("DestTrains", fields: [destStationId], references: [id])
+
+  stops    TrainStop[]
+  schedule TrainSchedule[]
+  classes  TrainClass[]
+  journeys Journey[]
+
+  @@unique([id, number])
+  @@index([originStationId, destStationId])
+  @@index([isActive])
+  @@index([name])
+}
+
+model TrainStop {
+  id                   String  @id @default(uuid(7))
+  trainId              String
+  stationId            String
+  stopIndex            Int
+  arrivalMinutes       Int?
+  departureMinutes     Int?
+  distanceFromOriginKm Int     @default(0)
+  isCommercial         Boolean @default(true)
+  platform             String?
+
+  train   Train   @relation(fields: [trainId], references: [id], onDelete: Cascade)
+  station Station @relation(fields: [stationId], references: [id])
+
+  @@unique([trainId, stopIndex])
+  @@unique([id, trainId])
+  @@index([stationId, stopIndex])
+  @@index([trainId, stationId])
+}
+
+// Supports MULTIPLE runs per weekday (e.g. a morning and an evening service).
+// `runNumber` disambiguates them and flows into Journey so the dated instance
+// can be tied back to exactly one schedule row.
+model TrainSchedule {
+  id         String @id @default(uuid(7))
+  trainId    String
+  dayOfWeek  Int // 0 = Sunday ... 6 = Saturday
+  runNumber  Int    @default(1)
+  departTime String // "06:00" IST wall clock — NOT an instant
+  arriveTime String
+
+  train    Train     @relation(fields: [trainId], references: [id], onDelete: Cascade)
+  journeys Journey[]
+
+  @@unique([trainId, dayOfWeek, runNumber])
+  @@unique([id, trainId])
+  @@index([dayOfWeek])
+}
+
+model TrainClass {
+  id            String    @id @default(uuid(7))
+  trainId       String
+  classType     ClassType
+  coachCount    Int       @default(1)
+  seatsPerCoach Int       @default(80)
+  totalSeats    Int
+  fareBase      Int       @default(0) // paise
+  farePerKm     Int       @default(0) // paise per km
+  isAc          Boolean   @default(false)
+  hasPantry     Boolean   @default(false)
+
+  train    Train          @relation(fields: [trainId], references: [id], onDelete: Cascade)
+  journeys JourneyClass[]
+
+  @@unique([trainId, classType])
+}
+
+// ═════════════════════════ Journey (one dated run) ═════════════════════════
+
+model Journey {
+  id              String        @id @default(uuid(7))
+  trainId         String
+  trainScheduleId String
+  runNumber       Int           @default(1)
+  date            DateTime      @db.Date // travel date — no timezone
+  status          JourneyStatus @default(SCHEDULED)
+  departureAt     DateTime      @db.Timestamptz(3) // real instant
+  arrivalAt       DateTime      @db.Timestamptz(3) // real instant
+  isCancelled     Boolean       @default(false)
+  cancelReason    String?
+  createdAt       DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime      @updatedAt @db.Timestamptz(3)
+
+  train         Train         @relation(fields: [trainId], references: [id], onDelete: Cascade)
+  // Composite FK: the schedule must belong to the SAME train.
+  trainSchedule TrainSchedule @relation(fields: [trainScheduleId, trainId], references: [id, trainId])
+  classes       JourneyClass[]
+  bookings      Booking[]
+
+  @@unique([trainId, date, runNumber])
+  @@unique([id, trainId])
+  @@index([date, isCancelled])
+  @@index([trainId, date, status])
+}
+
+model JourneyClass {
+  id            String    @id @default(uuid(7))
+  journeyId     String
+  trainClassId  String
+  classType     ClassType
+  coachCount    Int
+  seatsPerCoach Int
+  totalSeats    Int
+  coachLayout   Json?
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+
+  journey    Journey      @relation(fields: [journeyId], references: [id], onDelete: Cascade)
+  trainClass TrainClass   @relation(fields: [trainClassId], references: [id])
+  seats      JourneySeat[]
+
+  @@unique([journeyId, trainClassId])
+  @@unique([id, journeyId]) // composite-FK target for JourneySeat
+  @@index([journeyId, classType])
+}
+
+// Physical seat inventory for one journey. Holds NO reservation state —
+// `isBlocked` is an admin override only. See TicketSeat for occupancy.
+model JourneySeat {
+  id             String    @id @default(uuid(7))
+  journeyClassId String
+  journeyId      String
+  coachNumber    Int
+  seatNumber     Int
+  berthType      SeatType  @default(SEAT)
+  isBlocked      Boolean   @default(false)
+  blockedReason  String?
+  createdAt      DateTime  @default(now()) @db.Timestamptz(3)
+
+  // Composite FK: the class must belong to the SAME journey.
+  journeyClass JourneyClass @relation(fields: [journeyClassId, journeyId], references: [id, journeyId], onDelete: Cascade)
+  ticketSeats  TicketSeat[]
+
+  @@unique([journeyClassId, coachNumber, seatNumber])
+  @@unique([id, journeyId]) // composite-FK target for TicketSeat
+  @@index([journeyId, isBlocked])
+  @@index([journeyId, coachNumber, seatNumber])
+}
+
+// ═════════════════════════ Booking ═════════════════════════
+
+model Booking {
+  id              String        @id @default(uuid(7))
+  pnr             String        @unique
+  userId          String
+  journeyId       String
+  travelDate      DateTime      @db.Date
+  originStationId String
+  destStationId   String
+  fromStopIndex   Int
+  toStopIndex     Int
+  status          BookingStatus @default(PENDING)
+  totalAmount     Int           @default(0) // paise, cache of SUM(ticket fare)
+  refundAmount    Int           @default(0)
+  contactPhone    String?
+  contactEmail    String?
+  isRefundable    Boolean       @default(true)
+  holdExpiresAt   DateTime?     @db.Timestamptz(3)
+  bookedAt        DateTime      @default(now()) @db.Timestamptz(3)
+  createdAt       DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime      @updatedAt @db.Timestamptz(3)
+
+  user    User    @relation(fields: [userId], references: [id])
+  journey Journey @relation(fields: [journeyId], references: [id])
+  origin  Station @relation("BookingOrigin", fields: [originStationId], references: [id])
+  dest    Station @relation("BookingDest", fields: [destStationId], references: [id])
+  tickets Ticket[]
+  payments Payment[]
+  refunds  Refund[]
+
+  // composite-FK target: proves ticket.journeyId AND ticket.userId match
+  @@unique([id, journeyId, userId])
+  @@index([userId, bookedAt])
+  @@index([journeyId])
+  @@index([travelDate, status])
+  @@index([status, holdExpiresAt]) // hold-expiry sweeper
+}
+
+// One ticket = one passenger's entitlement. Grain chosen so a single
+// passenger can be cancelled, re-priced or refunded independently.
+model Ticket {
+  id              String       @id @default(uuid(7))
+  bookingId       String
+  journeyId       String
+  userId          String // denormalized from Booking, enforced by composite FK
+  passengerId     String?
+  name            String
+  age             Int
+  gender          Gender
+  berthPreference String?
+  classType       ClassType
+  seatType        SeatType     @default(SEAT)
+  status          TicketStatus @default(PENDING)
+  fareAmount      Int
+  discountAmount  Int          @default(0)
+  refundAmount    Int          @default(0)
+  isRefundable    Boolean      @default(true)
+  // Historical snapshot — survives TicketSeat deletion on cancellation.
+  coachNumber     Int?
+  seatNumber      Int?
+  createdAt       DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime     @updatedAt @db.Timestamptz(3)
+
+  // Composite FK (bookingId, journeyId, userId) → Booking(id, journeyId, userId):
+  // a ticket physically cannot point at Booking A while carrying journey B
+  // or another user's id.
+  booking   Booking        @relation(fields: [bookingId, journeyId, userId], references: [id, journeyId, userId], onDelete: Cascade)
+  passenger SavedPassenger? @relation(fields: [passengerId], references: [id])
+  seat      TicketSeat?
+  fareItems FareItem[]
+  refunds   Refund[]
+
+  @@unique([id, journeyId]) // composite-FK target for TicketSeat
+  @@index([bookingId])
+  @@index([journeyId, classType, status])
+  @@index([status])
+  @@index([passengerId])
+}
+
+// The live reservation. Exists while the seat is held or booked; DELETED on
+// cancel/expiry so the exclusion constraint frees the seat automatically.
+model TicketSeat {
+  id            String   @id @default(uuid(7))
+  ticketId      String   @unique
+  journeySeatId String
+  journeyId     String
+  fromStopIndex Int
+  toStopIndex   Int
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+
+  // Composite FK: ticket and seat must belong to the SAME journey.
+  ticket      Ticket      @relation(fields: [ticketId, journeyId], references: [id, journeyId], onDelete: Cascade)
+  journeySeat JourneySeat @relation(fields: [journeySeatId, journeyId], references: [id, journeyId])
+
+  // Plain guard against exact duplicates. Overlap is prevented by the GiST
+  // exclusion constraint in docs/migrations/v2_integrity.sql:
+  //   EXCLUDE USING gist ("journeySeatId" WITH =,
+  //     int4range("fromStopIndex","toStopIndex",'[)') WITH &&)
+  @@unique([ticketId, journeyId]) // required for the composite FK above
+  @@unique([journeySeatId, fromStopIndex, toStopIndex])
+  @@index([journeySeatId])
+  @@index([ticketId])
+}
+
+model FareItem {
+  id        String   @id @default(uuid(7))
+  ticketId  String
+  type      FareType
+  label     String
+  amount    Int // paise; negative for discounts
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+}
+
+// ═════════════════════════ Payments ═════════════════════════
+
+model Payment {
+  id              String        @id @default(uuid(7))
+  bookingId       String
+  attempt         Int           @default(1)
+  amount          Int // paise
+  status          PaymentStatus @default(INITIATED)
+  method          PaymentMethod?
+  provider        String        @default("mock")
+  providerOrderId String?
+  transactionId   String?       @unique
+  idempotencyKey  String        @unique
+  version         Int           @default(0) // optimistic lock for state transitions
+  failureReason   String?
+  paidAt          DateTime?     @db.Timestamptz(3)
+  createdAt       DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime      @updatedAt @db.Timestamptz(3)
+
+  booking Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  events  PaymentEvent[]
+
+  @@unique([bookingId, attempt])
+  @@unique([provider, providerOrderId])
+  @@index([bookingId])
+  @@index([status])
+}
+
+// Append-only webhook ledger. `providerEventId` is the idempotency key:
+// INSERT ... ON CONFLICT DO NOTHING → 0 rows inserted means "already handled".
+model PaymentEvent {
+  id              String    @id @default(uuid(7))
+  paymentId       String
+  providerEventId String    @unique
+  event           String
+  payload         Json
+  signature       String?
+  signatureValid  Boolean   @default(false)
+  processedAt     DateTime? @db.Timestamptz(3)
+  error           String?
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId, createdAt])
+}
+
+model Refund {
+  id               String       @id @default(uuid(7))
+  bookingId        String
+  ticketId         String? // NULL = whole-booking refund
+  amount           Int
+  status           RefundStatus @default(PENDING)
+  reason           RefundReason
+  note             String?
+  providerRefundId String?
+  processedAt      DateTime?    @db.Timestamptz(3)
+  createdAt        DateTime     @default(now()) @db.Timestamptz(3)
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  ticket  Ticket? @relation(fields: [ticketId], references: [id])
+
+  @@index([bookingId])
+  @@index([ticketId])
+  @@index([status])
+}
+
+// ═════════════════════════ Ops ═════════════════════════
+
+model AuditLog {
+  id         String    @id @default(uuid(7))
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  ip         String?
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+}

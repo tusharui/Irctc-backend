@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import { logger } from "hono/logger";
+import { isExclusionViolation, isIntegrityViolation, isUniqueViolation } from "./db/errors";
 import { errorBody } from "./lib/validation";
 import type { AuthVariables } from "./middleware/auth";
 import { authRoutes } from "./modules/auth/auth.routes";
@@ -26,6 +27,18 @@ export function createApp() {
    
     if (err instanceof HTTPException) {
       return c.json(errorBody(err.message || `HTTP ${err.status}`), err.status);
+    }
+
+    // Constraint violations are a normal outcome under concurrency, not a
+    // bug: translate the database's "no" into a precise client error.
+    if (isExclusionViolation(err)) {
+      return c.json(errorBody("Seat already reserved for this segment"), 409);
+    }
+    if (isUniqueViolation(err)) {
+      return c.json(errorBody("Duplicate record"), 409);
+    }
+    if (isIntegrityViolation(err)) {
+      return c.json(errorBody("Request violates a data constraint"), 400);
     }
 
     console.error("Unhandled error:", err);

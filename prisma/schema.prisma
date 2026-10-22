@@ -152,6 +152,7 @@ model Booking {
   status       BookingStatus @default(PENDING)
   totalAmount  Int
   isRefundable Boolean       @default(true)
+  holdExpiresAt DateTime?    @db.Timestamptz(3)
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
 
@@ -177,28 +178,97 @@ model BookingPassenger {
 }
 
 model BookingSeat {
-  id           String @id @default(uuid())
+  id           String   @id @default(uuid())
   bookingId    String
   seatId       String
   trainClassId String
+  // A physical seat is reusable across travel dates. Without this column the
+  // old `@@unique([seatId])` made a seat bookable exactly once, ever.
+  travelDate   DateTime @db.Date
 
   booking    Booking    @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   seat       Seat       @relation(fields: [seatId], references: [id])
   trainClass TrainClass @relation(fields: [trainClassId], references: [id])
 
-  @@unique([seatId])
+  @@unique([seatId, travelDate])
   @@index([bookingId])
 }
 
 model Payment {
-  id            String        @id @default(uuid())
-  bookingId     String        @unique
-  amount        Int
-  status        PaymentStatus @default(INITIATED)
-  transactionId String?       @unique
-  provider      String        @default("mock")
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
+  id             String        @id @default(uuid())
+  bookingId      String        @unique
+  amount         Int
+  status         PaymentStatus @default(INITIATED)
+  transactionId  String?       @unique
+  provider       String        @default("mock")
+  providerOrderId String?
+  // Idempotency: retrying a payment request must not charge twice.
+  idempotencyKey String?       @unique
+  // Optimistic lock for webhook-driven state transitions.
+  version        Int           @default(0)
+  paidAt         DateTime?     @db.Timestamptz(3)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
 
-  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  booking Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  events  PaymentEvent[]
+
+  @@unique([provider, providerOrderId])
+}
+
+// Append-only webhook ledger. `providerEventId` is UNIQUE, so replaying a
+// webhook is a no-op: INSERT ... ON CONFLICT DO NOTHING returns 0 rows and
+// the handler knows the event was already processed.
+model PaymentEvent {
+  id              String    @id @default(uuid())
+  paymentId       String
+  providerEventId String?   @unique
+  event           String
+  payload         Json
+  signature       String?
+  signatureValid  Boolean   @default(false)
+  processedAt     DateTime? @db.Timestamptz(3)
+  error           String?
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId, createdAt])
+}
+
+// ── v2 reservation core ──────────────────────────────────────────────
+// These tables are created by prisma/migrations/*_reservation_constraints.
+// JourneySeat holds physical inventory only (no reservation state), so it
+// can never contradict TicketSeat, which is the single source of truth for
+// occupancy. `TicketSeat_no_segment_overlap` (a GiST EXCLUDE constraint)
+// lives in raw SQL because Prisma cannot express it.
+
+model JourneySeat {
+  id            String   @id @default(uuid())
+  journeyId     String
+  coachNumber   Int
+  seatNumber    Int
+  isBlocked     Boolean  @default(false)
+  blockedReason String?
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+
+  ticketSeats TicketSeat[]
+
+  @@unique([journeyId, coachNumber, seatNumber])
+  @@index([journeyId, isBlocked])
+}
+
+model TicketSeat {
+  id            String   @id @default(uuid())
+  ticketId      String   @unique
+  journeySeatId String
+  journeyId     String
+  fromStopIndex Int
+  toStopIndex   Int
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+
+  journeySeat JourneySeat @relation(fields: [journeySeatId], references: [id])
+
+  @@unique([journeySeatId, fromStopIndex, toStopIndex])
+  @@index([journeySeatId])
 }

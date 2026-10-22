@@ -59,5 +59,9 @@ export const requireAdmin: MiddlewareHandler<AuthEnv> = async (c, next) => {
     throw new HTTPException(403, { message: "Admin access required" });
   }
 
+  // Put the payload on the context so downstream handlers can read
+  // c.get("user") even when requireAdmin runs without requireAuth.
+  c.set("user", payload);
+
   await next();
 };
