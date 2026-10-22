@@ -1,11 +1,5 @@
 import { z } from "zod";
 
-// ────────────────────────────────────────────────────────────────────
-// Request schemas for the auth endpoints.
-//
-// Zod runs inside our zValidator wrapper, so a failure comes back in
-// the canonical error body with the offending field's path.
-// ────────────────────────────────────────────────────────────────────
 
 export const registerSchema = z.object({
   email: z.email().max(254),

@@ -40,8 +40,6 @@ async function makeTrain(opts: { seats?: number; classType?: any } = {}) {
       name: "Integrity Express",
       originStationId: s1.id,
       destStationId: s2.id,
-      startTime: "08:00",
-      endTime: "14:00",
     },
   });
   const seatCount = opts.seats ?? 1;

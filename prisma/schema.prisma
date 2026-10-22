@@ -46,6 +46,13 @@ enum ClassType {
   SECOND_CLASS
 }
 
+enum JourneyStatus {
+  SCHEDULED
+  STARTED
+  COMPLETED
+  CANCELLED
+}
+
 // ───────────────────────────── Models ─────────────────────────────
 
 model User {
@@ -74,13 +81,14 @@ model Station {
   stops        TrainStop[]
 }
 
+// The physical train: number, name, endpoints and the ordered route. It has no
+// timetable of its own — departure times belong to a schedule, and a particular
+// day's running belongs to a Journey. That is what lets the same train run at
+// different times on different days without rewriting its route.
 model Train {
   id         String   @id @default(uuid())
   number     String   @unique // e.g. "12001"
   name       String
-  runsDaily  Boolean  @default(true)
-  startTime  String // "06:00"
-  endTime    String // "20:30"
   distanceKm Int      @default(0)
   baseFare   Int      @default(0) // paise
   isActive   Boolean  @default(true)
@@ -91,9 +99,96 @@ model Train {
   originStation   Station  @relation("OriginTrains", fields: [originStationId], references: [id])
   destStation     Station  @relation("DestTrains", fields: [destStationId], references: [id])
 
-  stops    TrainStop[]
-  classes  TrainClass[]
-  bookings Booking[]
+  stops     TrainStop[]
+  classes   TrainClass[]
+  bookings  Booking[]
+  schedules TrainSchedule[]
+  journeys  Journey[]
+
+  @@index([originStationId])
+  @@index([destStationId])
+}
+
+// When a train runs, independent of what its route is.
+//
+// One row per weekday per run number. `validFrom`/`validTo` are how a timetable
+// change is published without mutating history: close the old row's validity
+// and open a new one. `departTime`/`arriveTime` are IST wall-clock strings —
+// the same route can run at 06:00 on weekdays and 08:00 on Sunday.
+model TrainSchedule {
+  id         String    @id @default(uuid())
+  trainId    String
+  /// 0 = Sunday … 6 = Saturday, matching `Date.getUTCDay()`.
+  dayOfWeek  Int
+  /// Multiple services per day on the same route (1 = first departure).
+  runNumber  Int       @default(1)
+  departTime String // "06:00"
+  arriveTime String // "23:00", possibly before departTime (overnight)
+  validFrom  DateTime  @db.Date
+  validTo    DateTime? @db.Date
+  isActive   Boolean   @default(true)
+  createdAt  DateTime  @default(now())
+
+  train    Train     @relation(fields: [trainId], references: [id], onDelete: Cascade)
+  journeys Journey[]
+
+  @@unique([trainId, dayOfWeek, runNumber])
+  // Target for Journey's composite FK, so a journey cannot point at another
+  // train's schedule.
+  @@unique([id, trainId])
+  @@index([dayOfWeek])
+}
+
+// One train, on one calendar date, from one schedule.
+//
+// Overnight services make this more than (trainId, date): the 21:10 departure
+// from Delhi arrives in Chennai on the *next* calendar day, so `date` is the
+// service date and `departureAt`/`arrivalAt` are real instants.
+model Journey {
+  id              String        @id @default(uuid())
+  trainId         String
+  trainScheduleId String
+  runNumber       Int           @default(1)
+  date            DateTime      @db.Date
+  status          JourneyStatus @default(SCHEDULED)
+  departureAt     DateTime      @db.Timestamptz(3)
+  arrivalAt       DateTime      @db.Timestamptz(3)
+  createdAt       DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime      @updatedAt @db.Timestamptz(3)
+
+  train         Train         @relation(fields: [trainId], references: [id], onDelete: Cascade)
+  trainSchedule TrainSchedule @relation(fields: [trainScheduleId, trainId], references: [id, trainId])
+  classes       JourneyClass[]
+
+  @@unique([trainId, date, runNumber])
+  @@unique([id, trainId])
+  @@index([date])
+  @@index([trainId, date])
+}
+
+// Per-journey snapshot of a class's inventory and fares.
+//
+// A fare change or coach reallocation tomorrow must not retroactively reprice a
+// journey that is already on sale, so the values are copied rather than read
+// through `TrainClass` at request time.
+model JourneyClass {
+  id            String    @id @default(uuid())
+  journeyId     String
+  trainClassId  String
+  classType     ClassType
+  coachCount    Int
+  seatsPerCoach Int
+  totalSeats    Int
+  baseFare      Int // paise
+  farePerKm     Int // paise per km
+  createdAt     DateTime  @default(now())
+
+  journey    Journey    @relation(fields: [journeyId], references: [id], onDelete: Cascade)
+  trainClass TrainClass @relation(fields: [trainClassId], references: [id])
+
+  @@unique([journeyId, trainClassId])
+  @@unique([id, journeyId])
+  @@index([journeyId, classType])
 }
 
 model TrainStop {
@@ -122,9 +217,10 @@ model TrainClass {
   farePerKm     Int       @default(0) // paise per km
   baseFare      Int       @default(0) // paise
 
-  train        Train          @relation(fields: [trainId], references: [id], onDelete: Cascade)
-  seats        Seat[]
-  bookingSeats BookingSeat[]
+  train          Train          @relation(fields: [trainId], references: [id], onDelete: Cascade)
+  seats          Seat[]
+  bookingSeats   BookingSeat[]
+  journeyClasses JourneyClass[]
 
   @@unique([trainId, classType])
 }

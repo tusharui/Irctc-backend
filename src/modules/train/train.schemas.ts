@@ -1,19 +1,12 @@
 import { z } from "zod";
 import { travelDateSchema } from "../booking/booking.schemas";
-
-/** Station codes are compared upper-case: "ndls" and "NDLS" are one station. */
-export const stationCodeSchema = z
-  .string()
-  .trim()
-  .min(2)
-  .max(10)
-  .transform((value) => value.toUpperCase());
+import { stationCodeSchema } from "../station/station.schemas";
 
 export const searchTrainsQuerySchema = z
   .object({
     from: stationCodeSchema,
     to: stationCodeSchema,
-    /** Optional. Without it, fares are quoted but no availability is shown. */
+    /** The service date. Without it you get timetables and fares, no journeys. */
     date: travelDateSchema.optional(),
   })
   .refine((value) => value.from !== value.to, {
@@ -21,10 +14,12 @@ export const searchTrainsQuerySchema = z
     path: ["to"],
   });
 
-export const availabilityQuerySchema = z
+/**
+ * A journey already knows its date, so availability only needs an optional
+ * segment. Both stations or neither.
+ */
+export const journeyAvailabilityQuerySchema = z
   .object({
-    date: travelDateSchema,
-    /** Optional segment. Both or neither. */
     from: stationCodeSchema.optional(),
     to: stationCodeSchema.optional(),
   })
@@ -33,9 +28,11 @@ export const availabilityQuerySchema = z
     path: ["to"],
   });
 
-export const trainIdParamSchema = z.object({
-  id: z.string().min(1),
+export const journeyIdParamSchema = z.object({
+  journeyId: z.string().min(1),
 });
 
 export type SearchTrainsQuery = z.infer<typeof searchTrainsQuerySchema>;
-export type AvailabilityQuery = z.infer<typeof availabilityQuerySchema>;
+export type JourneyAvailabilityQuery = z.infer<
+  typeof journeyAvailabilityQuerySchema
+>;

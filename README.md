@@ -30,8 +30,9 @@ curl http://localhost:4000/api/db-check
 | `POST` | `/api/auth/register` | — | Create a user, returns `{ user, token }` (201) |
 | `POST` | `/api/auth/login` | — | Exchange credentials for `{ user, token }` (200) |
 | `GET` | `/api/auth/me` | Bearer | The current user, re-read from the database (200) |
-| `GET` | `/api/trains/search` | — | Trains between two stations, with fares (200) |
-| `GET` | `/api/trains/:id/availability` | — | Per-class seats left for a date (200) |
+| `GET` | `/api/v1/stations?search=Delhi` | — | Station typeahead by code, name or city (200) |
+| `GET` | `/api/v1/trains/search` | — | Trains between two stations for a date (200) |
+| `GET` | `/api/v1/journeys/:journeyId/availability` | — | Per-class seats left on one dated journey (200) |
 | `POST` | `/api/bookings` | Bearer | Hold seats for a travel date, returns the booking (201) |
 | `GET` | `/api/bookings` | Bearer | The caller's bookings, newest first (200) |
 | `GET` | `/api/bookings/:id` | Bearer | One booking, owner only (200) |
@@ -49,14 +50,17 @@ curl -X POST http://localhost:4000/api/auth/register \
 # Use the token
 curl http://localhost:4000/api/auth/me -H "Authorization: Bearer <token>"
 
-# Search: fares are priced for the segment, not the whole run
-curl "http://localhost:4000/api/trains/search?from=NDLS&to=KGP&date=2027-01-15"
+# Station typeahead
+curl "http://localhost:4000/api/v1/stations?search=Delhi"
 
-# Availability for one train, whole run
-curl "http://localhost:4000/api/trains/<trainId>/availability?date=2027-01-15"
+# Search: one result per train running that weekday, each with a journeyId
+curl "http://localhost:4000/api/v1/trains/search?from=NDLS&to=JP&date=2026-11-01"
 
-# Availability for a segment
-curl "http://localhost:4000/api/trains/<trainId>/availability?date=2027-01-15&from=NDLS&to=KGP"
+# Availability for that journey, whole run
+curl "http://localhost:4000/api/v1/journeys/<journeyId>/availability"
+
+# Availability for a segment of that journey
+curl "http://localhost:4000/api/v1/journeys/<journeyId>/availability?from=NDLS&to=JP"
 
 # Hold one seat on that segment (stop indices come from the search response)
 curl -X POST http://localhost:4000/api/bookings \
@@ -112,6 +116,31 @@ Every error — validation, auth, rate limit, 404 — has the same shape:
 > behind a load balancer, each instance keeps its own counters — swap in
 > `RedisStore` / `UnstorageStore` before scaling out.
 
+## Train, schedule, journey
+
+Three things that are easy to conflate and expensive to separate later:
+
+| Concept | Row | Answers |
+|---|---|---|
+| Physical train | `Train` + `TrainStop` | "what route does 12001 take, and how far is each stop?" |
+| Timetable | `TrainSchedule` | "does it run on Sundays, at what time, and since/until when?" |
+| Dated service | `Journey` + `JourneyClass` | "12001 on 2026-11-01" — the thing you book |
+
+A `Journey` stores **instants**, not clock strings. `date` is the service date;
+`departureAt`/`arrivalAt` are `timestamptz`. Timetable strings are IST wall
+clock, converted on creation, so an overnight train that leaves Delhi at 21:10
+on 1 November and reaches Chennai at 09:40 has `arrivalAt` on 2 November.
+
+Journeys are materialised lazily by the first dated search and are idempotent —
+a unique `(trainId, date, runNumber)` plus `createMany({ skipDuplicates: true })`
+means two concurrent searches create one row. `JourneyClass` snapshots fares and
+inventory at that moment, so changing a price tomorrow does not reprice a
+journey already on sale.
+
+`/api/v1` is the canonical prefix for these reads. The same router is also
+mounted at `/api` as a legacy alias while the booking and payment endpoints
+finish migrating.
+
 ## Routes, segments and fares
 
 A train has an ordered route (`TrainStop`, `stopIndex` 0..n). A search is a
@@ -131,7 +160,7 @@ there is a test asserting search and booking agree.
 
 | Term | Source |
 |---|---|
-| `totalSeats` | `TrainClass.totalSeats` |
+| `totalSeats` | `JourneyClass.totalSeats` (snapshot of `TrainClass`) |
 | `booked` | `BookingSeat` rows for that class and travel date |
 | `blocked` | `Seat.isAvailable = false` (admin took it out of service) |
 

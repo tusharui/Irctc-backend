@@ -7,6 +7,7 @@ const prisma = new PrismaClient({ adapter });
 
 const STATIONS = [
   { code: "NDLS", name: "New Delhi", city: "Delhi", state: "Delhi", zone: "Northern" },
+  { code: "JP", name: "Jaipur Junction", city: "Jaipur", state: "Rajasthan", zone: "North Western" },
   { code: "BCT", name: "Mumbai CSMT", city: "Mumbai", state: "Maharashtra", zone: "Western" },
   { code: "SBC", name: "Bengaluru City", city: "Bengaluru", state: "Karnataka", zone: "Southern" },
   { code: "MAS", name: "Chennai Central", city: "Chennai", state: "Tamil Nadu", zone: "Southern" },
@@ -45,7 +46,7 @@ const TRAINS: SeedTrain[] = [
     end: "23:00",
     stops: [
       { code: "NDLS", distanceKm: 0, arrival: null, departure: "06:00" },
-      { code: "KGP", distanceKm: 700, arrival: "13:30", departure: "13:40" },
+      { code: "JP", distanceKm: 300, arrival: "09:40", departure: "09:50" },
       { code: "BCT", distanceKm: 1388, arrival: "23:00", departure: null },
     ],
   },
@@ -143,8 +144,6 @@ async function main() {
         originStationId: stationIds.get(t.from)!,
         destStationId: stationIds.get(t.to)!,
         distanceKm: t.dist,
-        startTime: t.start,
-        endTime: t.end,
       },
       create: {
         number: t.number,
@@ -152,10 +151,37 @@ async function main() {
         originStationId: stationIds.get(t.from)!,
         destStationId: stationIds.get(t.to)!,
         distanceKm: t.dist,
-        startTime: t.start,
-        endTime: t.end,
       },
     });
+
+    // ── Weekly schedule ──────────────────────────────────────
+    // The seeded trains run daily, so each gets one row per weekday. A real
+    // timetable would simply have fewer rows here, or a second `runNumber` for
+    // an evening service on the same route.
+    for (let dayOfWeek = 0; dayOfWeek <= 6; dayOfWeek++) {
+      await prisma.trainSchedule.upsert({
+        where: {
+          trainId_dayOfWeek_runNumber: {
+            trainId: train.id,
+            dayOfWeek,
+            runNumber: 1,
+          },
+        },
+        update: {
+          departTime: t.start,
+          arriveTime: t.end,
+          isActive: true,
+        },
+        create: {
+          trainId: train.id,
+          dayOfWeek,
+          runNumber: 1,
+          departTime: t.start,
+          arriveTime: t.end,
+          validFrom: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      });
+    }
 
     // ── Ordered route ────────────────────────────────────────
     for (const [index, stop] of t.stops.entries()) {
@@ -235,9 +261,10 @@ async function main() {
 
   const trainCount = await prisma.train.count();
   const stopCount = await prisma.trainStop.count();
+  const scheduleCount = await prisma.trainSchedule.count();
   const seatCount = await prisma.seat.count();
   console.log(
-    `✅ Seed complete — ${trainCount} trains, ${stopCount} stops, ${seatCount} seats`
+    `✅ Seed complete — ${trainCount} trains, ${stopCount} stops, ${scheduleCount} schedules, ${seatCount} seats`
   );
 }
 
